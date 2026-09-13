@@ -7,6 +7,7 @@ import uuid
 from ml.ocr import extract_text_from_image
 from config.settings import BASE_URL
 from parsers.page_resolver import PageResolver
+from parsers.manifest import build_manifest
 
 # Matches "Figure 25", "Fig. 3", "Table 7", etc. — used to cross-reference an
 # image to every section that talks ABOUT it by name, not just the section
@@ -25,10 +26,16 @@ FIGURE_LABEL_RE = re.compile(r'\b(Figures?|Figs?\.?|Tables?)\s+(\d+)\b', re.IGNO
 # re-converted once with Docling's OWN OCR engine turned on instead.
 MIN_CHARS_PER_PAGE_BEFORE_OCR_RETRY = 100
 
-def parse_deep_mode(file_path: str) -> list[dict]:
+def parse_deep_mode(file_path: str) -> tuple[list[dict], dict]:
     """
     Parses documents using IBM Docling with deep OCR and layout extraction.
     Capable of reading text inside images, diagrams, and complex tables.
+
+    Returns (chunks, manifest) — manifest is the document's structural index
+    (headings tree + figure/table locations, see parsers/manifest.py), used
+    at query time for "give me the whole chapter/section" and "list all
+    figures/tables" requests instead of relying on similarity search or an
+    ad-hoc live text scan to (maybe) find everything.
     """
     # Configure Pipeline for deepest extraction (OCR + Picture/Table generation)
     pipeline_options = PdfPipelineOptions()
@@ -339,7 +346,11 @@ def parse_deep_mode(file_path: str) -> list[dict]:
                     unique_headings.append(heading)
 
     toc_content = "# Document Table of Contents\n\n" + "\n".join([f"- {h}" for h in unique_headings])
-    
+
+    # Structural index (headings tree + figure/table locations) — built from
+    # the real content chunks only, before the synthetic ToC chunk below.
+    manifest = build_manifest(chunks_final)
+
     # Append the ToC as a special chunk
     chunks_final.append({
         "content": toc_content,
@@ -351,4 +362,4 @@ def parse_deep_mode(file_path: str) -> list[dict]:
         }
     })
 
-    return chunks_final
+    return chunks_final, manifest

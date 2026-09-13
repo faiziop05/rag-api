@@ -8,7 +8,6 @@ from api.stages.routing import select_target_headings
 from api.stages.retrieval import retrieve_results
 from api.stages.context import expand_and_deduplicate
 from api.stages.citations import select_cited_context, build_citations, filter_and_renumber_citations
-from api.stages.query_intent import detect_enumeration_intent
 from ml.reranker import rerank_results
 from ml.generation import generate_answer
 
@@ -89,7 +88,7 @@ def query_endpoint(req: QueryRequest):
         target_headings = select_target_headings(req.query, req.knowledge_base_id, supabase, req.user_id)
 
         # Stage 3: Hybrid retrieval
-        results = retrieve_results(
+        results, needs_full_context = retrieve_results(
             search_query=search_query,
             original_query=req.query,
             kb_id=req.knowledge_base_id,
@@ -104,19 +103,23 @@ def query_endpoint(req: QueryRequest):
         # Stage 4: Reranking
         reranked = rerank_results(search_query, results)
 
-        # "List all figures/tables" needs many more sources than a typical
-        # question — capping at 10 (and 6 citations) would silently drop
-        # most of what retrieval.py specifically went and found.
-        is_enumeration = bool(detect_enumeration_intent(req.query))
-        # Raised alongside the retrieval.py breadth-first fix (MAX_STRUCTURAL_MATCHES=40):
-        # citation_cap used to be 24, silently cutting off any document with
-        # more than 24 distinct figures/tables even after retrieval found them
-        # all — confirmed on a real 39-figure document. Now safe to raise:
-        # enumeration chunks are no longer expanded to their full parent
-        # section (see context.py), so even 40 of them stays well within any
-        # model's context window.
-        context_cap = 40 if is_enumeration else 10
-        citation_cap = 45 if is_enumeration else None
+        # "List all figures/tables" and "give me the whole chapter" both need
+        # many more sources than a typical question — capping at 10 (and 6
+        # citations) would silently drop most of what retrieval.py
+        # specifically went and found. needs_full_context covers BOTH cases
+        # (see retrieval.py's own comment on it) — a plain is_enumeration
+        # check would have missed the whole-chapter case entirely, and its
+        # citations would then have collapsed down to one per page (see
+        # dedupe_by_page below), which is wrong when several different
+        # paragraphs from the SAME fetched chapter share a page.
+        #
+        # citation_cap raised generously (80, up from an original 24) since
+        # generation.py now enforces its OWN hard character budget on the
+        # assembled prompt regardless of how many candidates are allowed
+        # through here — this cap just needs to not be the bottleneck before
+        # that safety net ever gets a chance to run.
+        context_cap = 40 if needs_full_context else 10
+        citation_cap = 80 if needs_full_context else None
 
         # `reranked` is already sorted by relevance — rerank_results()
         # overwrites even a "pinned" row's placeholder score with its real
@@ -145,7 +148,7 @@ def query_endpoint(req: QueryRequest):
             supabase,
             # Several different figures/tables often live in the same
             # section and would otherwise collapse into just the first one.
-            dedupe=not is_enumeration,
+            dedupe=not needs_full_context,
             user_id=req.user_id,
         )
 
@@ -159,7 +162,7 @@ def query_endpoint(req: QueryRequest):
             max_citations=citation_cap,
             # Two different figures/tables can legitimately share a page —
             # page-deduping would drop one of the very things being enumerated.
-            dedupe_by_page=not is_enumeration,
+            dedupe_by_page=not needs_full_context,
         )
 
         # Stage 6: LLM generation

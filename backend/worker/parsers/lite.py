@@ -3,11 +3,15 @@ import os
 import pymupdf as fitz  # PyMuPDF
 
 
-def parse_lite_mode(file_path: str) -> list[dict]:
+def parse_lite_mode(file_path: str) -> tuple[list[dict], dict]:
     """
     Parses a PDF or plain-text document using the lightweight path.
-    Returns a list of chunks (dictionaries with content and metadata).
+    Returns (chunks, manifest) for interface consistency with parse_deep_mode
+    /parse_medium_mode — lite mode has no heading/figure detection at all
+    (that's the whole point of "lite": fast, raw text, no structure), so its
+    manifest is always empty (headings=[], figures=[], tables=[]).
     """
+    empty_manifest = {"headings": [], "figures": [], "tables": []}
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext in {".txt", ".md", ".csv", ".json"}:
@@ -15,11 +19,11 @@ def parse_lite_mode(file_path: str) -> list[dict]:
             text = f.read()
 
         if not text.strip():
-            return []
+            return [], empty_manifest
 
         # Split on double newlines (paragraphs) rather than single newlines
         paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-        return [
+        chunks = [
             {
                 "content": paragraph,
                 "metadata": {"page_number": 1, "section": "General"},
@@ -27,6 +31,7 @@ def parse_lite_mode(file_path: str) -> list[dict]:
             for paragraph in paragraphs
             if paragraph and len(paragraph) > 10  # Filter very short fragments
         ]
+        return chunks, empty_manifest
 
     doc = fitz.open(file_path)
     chunks = []
@@ -46,4 +51,4 @@ def parse_lite_mode(file_path: str) -> list[dict]:
                 }
             )
 
-    return chunks
+    return chunks, empty_manifest

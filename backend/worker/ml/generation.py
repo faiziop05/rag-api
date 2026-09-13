@@ -101,6 +101,14 @@ def generate_answer(query: str, context_results: list[dict], history: list[dict]
     # anything left out is simply never given a citation number, so it
     # can't be cited (no desync with citations.py's numbering).
     MAX_TOTAL_CONTEXT_CHARS = 22000
+    # A single oversized chunk (confirmed real: a document's own literal
+    # "Contents" page parsed as one dense, unsplit ~16,000-char block of
+    # chapter names + page numbers, ranked highly for a query about
+    # "chapters" simply because it's full of that exact word) could burn
+    # almost the ENTIRE budget above by itself, crowding out every other
+    # source before the model ever saw them. Capping any one block keeps
+    # one outlier chunk from dominating the whole prompt.
+    MAX_CHARS_PER_BLOCK = 3000
 
     # Build context string - strip or keep images based on query type
     context_str = ""
@@ -109,6 +117,8 @@ def generate_answer(query: str, context_results: list[dict], history: list[dict]
         doc_name = doc.get('metadata', {}).get('document_name', f'Doc {idx+1}')
         page = doc.get('metadata', {}).get('page_number', 'N/A')
         content = doc.get('content', '')
+        if len(content) > MAX_CHARS_PER_BLOCK:
+            content = content[:MAX_CHARS_PER_BLOCK] + "...[truncated]"
         image_url = doc.get('metadata', {}).get('image_url', '')
         
         # Truncate repetitive Image Analysis blocks to keep context clean

@@ -1,10 +1,15 @@
 from docling.document_converter import DocumentConverter
 from parsers.page_resolver import PageResolver
+from parsers.manifest import build_manifest
 
-def parse_medium_mode(file_path: str) -> list[dict]:
+def parse_medium_mode(file_path: str) -> tuple[list[dict], dict]:
     """
     Parses complex documents using IBM Docling for layout-aware extraction.
     Preserves table structures and document hierarchies without heavy image OCR.
+
+    Returns (chunks, manifest) — see parsers/manifest.py. Medium mode never
+    extracts images, so manifest["figures"] is always empty here; headings
+    and any explicitly-labeled "Table N" references are still captured.
     """
     converter = DocumentConverter()
     result = converter.convert(file_path)
@@ -60,5 +65,6 @@ def parse_medium_mode(file_path: str) -> list[dict]:
                     "parent_context": parent_content
                 }
             })
-        
-    return chunks
+
+    manifest = build_manifest(chunks)
+    return chunks, manifest

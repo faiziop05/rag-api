@@ -83,6 +83,143 @@ each one actually does what it claims, fixing what's broken and recording
 the reasoning so later sessions don't have to re-derive it. Append a new
 `###` entry per stage as we go instead of re-litigating earlier ones.
 
+### New feature (branch `feature/document-manifest`): document structural index — 2026-09-13
+
+Built to replace the ad-hoc, similarity-search-dependent handling of "list
+all figures/tables" and "give me the whole chapter/section" requests with a
+real, persisted structural map of the document, built once at ingestion —
+see the chat transcript investigation earlier the same day for the
+user-reported failures this targets ("give me full background chapter" →
+"I don't have enough information"; "list all 45 endpoints" → partial/honest
+refusal; figure enumeration relying on a live regex scan).
+
+**New file: `parsers/manifest.py`** — `build_manifest(chunks)` walks the
+ALREADY-parsed chunk list (not a second, independent extraction pass) and
+produces `{headings: [...], figures: [...], tables: [...]}`:
+- **Headings** — one entry per distinct `metadata.section` value, with a
+  `level` (0=chapter, 1=section, 2=subsection) and a `[page_start, page_end]`
+  range. Docling's OWN heading-level attribute turned out to be useless for
+  this — confirmed on a real document that EVERY heading, from "Chapter 1"
+  down to "1.1.1 The Problem", reports `level=1` flat — so hierarchy is
+  classified from the heading TEXT's own numbering pattern instead
+  (`classify_heading()`: `Chapter N` → 0, `N.M` → 1, `N.M.K` → 2). Also
+  filters out a real Docling quirk: ordinary enumerated list items
+  ("1. Common Online Data Analysis Platform (CODAP)") sometimes get
+  misclassified as section headers — distinguished from real sub-numbering
+  ("1.1") by what follows the dot (a space vs. another digit).
+- **page_start** deliberately does NOT use the heading's own resolved page —
+  confirmed a real, pre-existing bug where a short heading line like
+  "## 1.1 Background & Motivation" resolves to the WRONG page via the
+  page-resolver's text matching (too short/generic to match reliably),
+  while the substantive paragraph right after it resolves correctly. Fixed
+  by taking the minimum page across every chunk in that section EXCLUDING
+  the bare heading-line stub itself.
+- **page_end** must extend through a heading's OWN subsections, not just to
+  the next entry in the flat list — confirmed "Chapter 2" and its first
+  subsection "2.1" both start on the same page, so naively using "next
+  heading's page_start" gave Chapter 2 a one-page range instead of covering
+  2.1-2.4 too. Fixed: a heading's end is the start of the next heading at
+  the SAME level or HIGHER (skipping past anything deeper, i.e. its own
+  children).
+- **Figures/tables** are derived from each chunk's own `image_url` +
+  cross-referenced label (the SAME data `deep.py`'s existing cross-
+  referencing pass already computes — not a new, separately-risky detection
+  mechanism), with a `caption` extracted as the actual text LINE containing
+  the "Figure N"/"Table N" match — real descriptive text ("Figure 25:
+  Classrooms Model Code"), not a bare label, which is what makes a "list all
+  figures" answer actually useful rather than just a number.
+- Docling's own per-item `.captions`/`.caption_text` attributes were tried
+  first and found EMPTY for this document's tables/pictures — confirmed
+  directly, not assumed — hence deriving captions from the chunk text
+  instead.
+
+**Parser return signature changed**: `parse_deep_mode`/`parse_medium_mode`/
+`parse_lite_mode` now return `(chunks, manifest)` instead of just `chunks`
+(lite mode's manifest is always empty — no structure to index there).
+`pipeline/processor.py` updated to unpack this and store the manifest as
+ONE extra row per document (`metadata.is_manifest = True`, `content` = the
+JSON-serialized manifest) — reuses the existing `documents` table/schema
+rather than needing a new migration; needs a placeholder embedding to
+satisfy the schema even though it's never meant to be found via similarity
+(explicitly excluded from search — see below).
+
+**Query-side wiring**:
+- `query_intent.py::detect_section_request(query, manifest)` — recognizes
+  "give me the full/whole/complete/entire chapter/section X" phrasing
+  specifically (NOT every question that happens to be about a topic some
+  heading covers — a normal question still gets a normal, topical answer).
+  Matches an explicit "Chapter N"/"Section N.M" number directly when
+  present; otherwise scores word-overlap between the query and each
+  heading's title. A real tie found and fixed: "give me the full background
+  chapter" tied between "Chapter 2: Background and existing systems" and an
+  unrelated "1.1 Background & Motivation" (both share only the word
+  "background") — resolved by using the query's own "chapter"/"section"
+  wording as a tie-breaker preferring the matching heading level.
+- `retrieval.py::fetch_manifest()` / `fetch_chunks_by_page_range()` — the
+  latter fetches EVERY chunk in a matched section's exact page range
+  directly, guaranteed complete (not a top-K similarity guess).
+- `retrieval.py::manifest_enumeration_matches()` — for "list all
+  figures/tables", reads the manifest's list directly when available
+  (reliable — replaces the live regex scan for documents that have a
+  manifest); falls back to the old scan for documents ingested before this
+  feature existed or where the manifest has nothing for the requested type.
+- `retrieve_results()` now returns `(results, needs_full_context)` —
+  `needs_full_context` covers BOTH enumeration AND whole-section requests,
+  since both need `context.py`'s dedup-by-section collapsing turned off
+  (fetching many paragraphs of the SAME section would otherwise collapse
+  down to one) and a much higher `context_cap`/`citation_cap` in
+  `router.py` (40 / 80, up from 10 / None) — a plain "is this an
+  enumeration query" check would have missed the whole-section case
+  entirely.
+
+**Two real bugs found and fixed WHILE testing this end-to-end** (not
+theoretical — both directly broke the very first live test):
+1. The synthetic `is_toc` housekeeping chunk (and the new `is_manifest`
+   chunk) were never excluded from normal retrieval — confirmed live: for
+   "give me the full background chapter", the ToC chunk (containing every
+   chapter name) reranked HIGHER than most real chapter content, since it's
+   literally full of the query's own keywords. Fixed by excluding both
+   flags in `retrieval.py`'s merge step.
+2. A document's own literal "Contents" page (the real, rendered table of
+   contents FROM THE PDF ITSELF, not a synthetic chunk) got parsed as one
+   dense, unsplit ~16,000-character block — confirmed this single chunk
+   nearly ate the ENTIRE 22,000-char generation budget by itself, before
+   the "is_toc" fix even landed. Fixed with a general per-block size cap in
+   `generation.py` (`MAX_CHARS_PER_BLOCK = 3000`) — defense-in-depth against
+   ANY oversized chunk from any source, not just this one.
+
+**Verified end-to-end, live, against the real 97-page/39-figure document**:
+- "give me the full background chapter" — went from "I don't have enough
+  information" (before this feature) to a genuinely comprehensive answer
+  correctly covering all four of Chapter 2's real subsections (2.1-2.4),
+  with 11 accurate citations quoting the real document text verbatim.
+- "list all figures" — manifest path confirmed active (real captions like
+  "Figure 25: Classrooms Model Code" appearing in the answer, not bare
+  labels), returning 28-35 of 39 figures across separate test runs — the
+  remaining gap under real testing-day rate-limit pressure is the SAME
+  already-documented, deliberately-accepted char-budget tradeoff from
+  earlier that day, not a new issue.
+
+**Known, accepted limitations (documented, not silently missed)**:
+- Unnumbered front/back-matter headings ("References", "Appendix") can
+  still resolve to a wrong page via the same short-generic-text page-
+  resolution weakness — the fix above only targeted the SPECIFIC case
+  found (a heading's own bare stub line), not this related but distinct
+  case. Only affects a handful of front/back-matter entries; the numbered
+  chapter hierarchy (what "give me chapter X" queries actually target) is
+  solid.
+- A handful of clearly non-heading strings (e.g. "Datasets (Base:
+  /api/teacher/datasets)") still appear as level-0 manifest entries —
+  Docling misclassifying API-route-looking text as a section header, a
+  different failure mode than the enumerated-list-item case the classifier
+  already filters. Cosmetic (extra manifest noise), not a correctness bug —
+  doesn't affect chapter/figure lookups.
+- Generalizing enumeration beyond figures/tables to arbitrary "list all X"
+  requests (e.g. "list all 45 API endpoints") was explicitly scoped OUT of
+  this pass — that needs structured extraction of arbitrary data tables'
+  row contents, a bigger, more document-specific feature, not attempted
+  here to avoid shipping something unverified.
+
 ### Stage: `pipeline/detector.py` (`determine_optimal_mode`) — audited & fixed 2026-09-13
 
 **What it's for:** when a document is ingested without an explicit

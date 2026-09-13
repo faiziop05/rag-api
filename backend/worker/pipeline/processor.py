@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import logging
 import tempfile
@@ -11,7 +12,7 @@ from pipeline.detector import determine_optimal_mode
 from parsers.lite import parse_lite_mode
 from parsers.medium import parse_medium_mode
 from parsers.deep import parse_deep_mode
-from ml.embeddings import generate_embeddings_batch
+from ml.embeddings import generate_embedding, generate_embeddings_batch
 from db.documents import insert_chunks
 from utils.text_clean import strip_markdown_artifacts
 
@@ -94,16 +95,17 @@ async def process_document(job: Job, token: str) -> dict:
     # moves the blocking call to a separate thread so the event loop stays
     # free to keep renewing the lock while parsing runs.
     chunks = []
+    manifest = {"headings": [], "figures": [], "tables": []}
     try:
         if mode == "deep":
             logger.info("Using Docling (Deep Mode — OCR & Images)")
-            chunks = await asyncio.to_thread(parse_deep_mode, file_path)
+            chunks, manifest = await asyncio.to_thread(parse_deep_mode, file_path)
         elif mode == "medium":
             logger.info("Using Docling (Medium Mode — Standard Layout)")
-            chunks = await asyncio.to_thread(parse_medium_mode, file_path)
+            chunks, manifest = await asyncio.to_thread(parse_medium_mode, file_path)
         else:
             logger.info("Using PyMuPDF (Lite Mode — Raw Text)")
-            chunks = await asyncio.to_thread(parse_lite_mode, file_path)
+            chunks, manifest = await asyncio.to_thread(parse_lite_mode, file_path)
     except Exception as e:
         logger.error(f"Error parsing document: {e}")
         raise
@@ -194,6 +196,36 @@ async def process_document(job: Job, token: str) -> dict:
             if user_id:
                 record["user_id"] = user_id
             records.append(record)
+
+        # Store the document's structural index (headings tree + figure/
+        # table locations, see parsers/manifest.py) as one extra row,
+        # alongside the normal chunks — reuses the existing `documents`
+        # table/schema rather than needing a new migration. Marked
+        # is_manifest=True so retrieval.py can fetch it directly (by
+        # knowledge_base_id + that flag) and — just as importantly — so
+        # normal hybrid/keyword search never surfaces this row as if it
+        # were a real, citable passage; its content is a JSON blob, not
+        # prose. Needs SOME embedding to satisfy the table's schema even
+        # though it's never meant to be found via similarity — a short,
+        # generic phrase is enough since it's excluded from search anyway.
+        if manifest.get("headings") or manifest.get("figures") or manifest.get("tables"):
+            manifest_embedding = await asyncio.to_thread(generate_embedding, "document structure manifest", "document")
+            manifest_record = {
+                "knowledge_base_id": kb_id,
+                "content": json.dumps(manifest),
+                "embedding": manifest_embedding,
+                "metadata": {
+                    "is_manifest": True,
+                    "document_name": original_name,
+                },
+            }
+            if user_id:
+                manifest_record["user_id"] = user_id
+            records.append(manifest_record)
+            logger.info(
+                f"Manifest: {len(manifest.get('headings', []))} headings, "
+                f"{len(manifest.get('figures', []))} figures, {len(manifest.get('tables', []))} tables."
+            )
 
         # ── Step 5: Persist to Supabase ───────────────────────────────────────
         logger.info(f"Starting Supabase insertion for {len(records)} records...")
