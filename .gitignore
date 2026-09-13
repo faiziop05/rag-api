@@ -1,0 +1,44 @@
+# ── Secrets — never commit these ──────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── Dependencies ───────────────────────────────────────────────────────────
+node_modules/
+venv/
+__pycache__/
+*.pyc
+
+# ── Build output ───────────────────────────────────────────────────────────
+dist/
+dist-ssr/
+build/
+
+# ── User-uploaded content (real documents/images, not code) ───────────────
+backend/gateway/uploads/
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ── Claude Code session-local runtime state ─────────────────────────────────
+.claude/scheduled_tasks.lock
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.local
